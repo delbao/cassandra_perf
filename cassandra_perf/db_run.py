@@ -31,10 +31,8 @@ _log_levels = {
     'NOTSET': logging.NOTSET,
 }
 
-# mpl = multiprocessing.log_to_stderr()
-# mpl.setLevel(logging.INFO)
 
-KEYSPACE = ''
+KEYSPACE = 'dbao_ad_analytics_realtime'
 TABLE = 'campaign_analytics_hourly_offset'
 
 COLUMNS_MAP = {
@@ -45,7 +43,7 @@ COLUMNS_MAP = {
     'kafka_offset': 'int',
 }
 
-PRIMARY_KEY = "(campaign_id, hour, partition)"
+PRIMARY_KEY = "(campaign_id, hour, kafka_partition)"
 
 
 def setup(args):
@@ -56,57 +54,63 @@ def setup(args):
     try:
         session = cluster.connect()
 
-        log.debug("Creating keyspace...")
+        rows = session.execute(
+            "SELECT keyspace_name FROM system.schema_keyspaces")
+
+        if KEYSPACE in [row[0] for row in rows]:
+            log.info("Dropping existing keyspace...")
+            session.execute("DROP KEYSPACE " + KEYSPACE)
+
+        log.info("Creating keyspace {} ...".format(KEYSPACE))
         try:
             session.execute("""
                 CREATE KEYSPACE %s
-                WITH replication = { 'class': 'SimpleStrategy',
-                'replication_factor': '2' }
+                WITH replication = { 'class': 'NetworkTopologyStrategy',
+                'norcal-devc': '3' }
                 """ % KEYSPACE)
-
-            log.debug("Setting keyspace ...")
         except cassandra.AlreadyExists:
             log.debug("Keyspace already exists")
 
-        session.set_keyspace(args.keyspace)
+        session.set_keyspace(KEYSPACE)
 
-        log.debug("Creating table...")
+        log.info("Creating table {} ...".format(TABLE))
         create_table_query = """
             CREATE TABLE {0} (
         """
-        for col_name, col_type in COLUMNS_MAP:
+        for col_name, col_type in COLUMNS_MAP.iteritems():
             create_table_query += \
                 "{col_name} {col_type},\n".format(col_name=col_name,
                                                   col_type=col_type)
         create_table_query += "PRIMARY KEY {pk})".format(pk=PRIMARY_KEY)
 
+        # log.debug("create table query {}".format(create_table_query))
         try:
             session.execute(create_table_query.format(TABLE))
         except cassandra.AlreadyExists:
             log.debug("Table already exists.")
 
-        insert_data(session, args.table, args.num_keys, args.num_process, 2)
+        log.info("Inserting {} keys ... ".format(args.num_keys))
+        insert_data(session, args.num_keys, args.num_processes, 2)
 
     finally:
         cluster.shutdown()
 
 
-def insert_data(session, table, num_keys, num_process, num_partition):
-    log.debug("Inserting {} keys ... ".format(num_keys))
+def insert_data(session, num_keys, num_processes, num_partition):
 
     cols = "(campaign_id, hour, kafka_partition, clicks_count, " \
            "kafka_offset)"
 
-    prepared_query = "INSERT INTO {table} {cols} VALUES (?,?,?,?,?)}".format(
-                    table=table,
+    prepared_query = "INSERT INTO {table} {cols} VALUES (?,?,?,?,?)".format(
+                    table=TABLE,
                     cols=cols)
     prepared = session.prepare(prepared_query)
 
     for campaign_id in range(num_keys):
-        for hour in range(num_process):
+        for hour in range(num_processes):
             for kafka_partition in range(num_partition):
-                session.execute(prepared.bind(campaign_id, hour,
-                                              kafka_partition, 0, 0))
+                session.execute(prepared.bind((campaign_id, hour,
+                                              kafka_partition, 0, 0)))
 
 
 def teardown(args):
@@ -114,7 +118,7 @@ def teardown(args):
                       token_metadata_enabled=False)
     session = cluster.connect()
     if not args.keep_data:
-        session.execute("DROP KEYSPACE " + args.keyspace)
+        session.execute("DROP KEYSPACE " + KEYSPACE)
     cluster.shutdown()
 
 
@@ -123,7 +127,7 @@ def parse_options():
     parser.add_argument('-H', '--hosts', default='127.0.0.1',
                         help='cassandra hosts to connect to (comma-separated '
                              'list) [default: %default]')
-    parser.add_argument('-p', '--processes', type=int, default=1,
+    parser.add_argument('-p', '--num-processes', type=int, default=1,
                         help='number of processes [default: %default]')
     parser.add_argument('-n', '--num-ops', type=int, default=10000,
                         help='number of operations [default: %default]')
@@ -136,10 +140,10 @@ def parse_options():
                         help='Native protocol version to use')
     parser.add_argument('-k', '--num-keys', type=int, default=200,
                         help='number of keys [default: %default]')
-    # parser.add_argument()
-    # parser.add_argument('--keep-data', action='store_true', dest='keep_data',
-    # default=False,
-    #                  help='Keep the data after the benchmark')
+    parser.add_argument('--keep-data', action='store_true', default=False,
+                        help='Keep the data after the benchmark')
+    parser.add_argument('--no-setup', action='store_true', default=False,
+                        help='Don\'t recreate table for the benchmark')
 
     args = parser.parse_args()
 
@@ -222,19 +226,19 @@ def benchmark():
     if args.protocol_version:
         kwargs['protocol_version'] = args.protocol_version
 
-    # setup(options)
-    log.info("==== %s ====" % (conn_class.__name__,))
+    if not args.no_setup:
+        log.info("Setting up keyspace {} and table {}".format(KEYSPACE, TABLE))
+        setup(args)
 
     log.debug("Sleeping for two seconds...")
     time.sleep(2.0)
 
-    query = None  # + the quert is defined in BenchmarkObject.run_query()
-    values = None  # we don't use that anymore. Keeping it in case we go back to prepared statements.
-    num_per_process = args.num_ops // args.processes
+    num_per_process = args.num_ops // args.num_processes
 
-    log.debug(
+    log.info(
         "Beginning {0}...".format('inserts')
     )
+    log.info("==== {} ====".format(conn_class.__name__,))
 
     # remove cluster setup/close time? like take the max of start/end time?
     start = time.time()
@@ -245,12 +249,11 @@ def benchmark():
     benchmark_object_list = [BenchmarkObject(i,  # process number
                                              kwargs,
                                              args.hosts,
-                                             args.keyspace,
-                                             query,
-                                             values,
                                              num_per_process,
-                                             args.profile)
-                             for i in range(args.processes)
+                                             args.num_keys,
+                                             args.profile,
+                                             output_metrics_q)
+                             for i in range(args.num_processes)
                              ]
 
     results = pool.map_async(apply_load, benchmark_object_list)
