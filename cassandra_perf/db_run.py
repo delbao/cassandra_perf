@@ -1,16 +1,15 @@
-from cProfile import Profile
+
 
 import multiprocessing
 
-import random
 import cassandra
 from cassandra.cluster import Cluster
 from cassandra.io.asyncorereactor import AsyncoreConnection
+from benchmarks.BenchmarkObject import BenchmarkObject
 
 import logging
 import time
 
-import traceback
 from greplin import scales
 import argparse
 
