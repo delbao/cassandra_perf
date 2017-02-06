@@ -9,9 +9,14 @@ from benchmarks.BenchmarkObject import BenchmarkObject
 
 import logging
 import time
+import sys
+
 
 from greplin import scales
 import argparse
+
+from collections import defaultdict
+
 
 log = logging.getLogger()
 handler = logging.StreamHandler()
@@ -152,64 +157,6 @@ def parse_options():
     return args
 
 
-def apply_load(benchmark_object):
-    """
-
-    :param benchmark_objects:
-    :return:
-    """
-    # TODO: remove options
-    hosts = benchmark_object.hosts
-    kwargs = benchmark_object.kwargs
-    keyspace = benchmark_object.keyspace
-    process_num = benchmark_object.process_num
-    num_queries = benchmark_object.num_queries
-
-    log.info("start {}".format(multiprocessing.current_process().name))
-
-    cluster = Cluster(hosts, **kwargs)
-    session = cluster.connect(keyspace)
-
-    futures = []
-    benchmark_object.start_profile()
-
-    for i in range(num_queries):
-        future = benchmark_object.run_query(process_num,
-                                            session)
-        futures.append(future)
-
-    for future in futures:
-        try:
-            future.result()
-        except Exception:
-            pass
-
-    benchmark_object.finish_profile()
-
-    cluster.shutdown()
-    stats = scales.getStats()['cassandra']
-
-    log.info("Connection errors: %d", stats['connection_errors'])
-    log.info("Write timeouts: %d", stats['write_timeouts'])
-    log.info("Read timeouts: %d", stats['read_timeouts'])
-    log.info("Unavailables: %d", stats['unavailables'])
-    log.info("Other errors: %d", stats['other_errors'])
-    log.info("Retries: %d", stats['retries'])
-
-    request_timer = stats['request_timer']
-    log.info("Request latencies:")
-    log.info("  min: %0.4fs", request_timer['min'])
-    log.info("  max: %0.4fs", request_timer['max'])
-    log.info("  mean: %0.4fs", request_timer['mean'])
-    log.info("  stddev: %0.4fs", request_timer['stddev'])
-    log.info("  median: %0.4fs", request_timer['median'])
-    log.info("  75th: %0.4fs", request_timer['75percentile'])
-    log.info("  95th: %0.4fs", request_timer['95percentile'])
-    log.info("  98th: %0.4fs", request_timer['98percentile'])
-    log.info("  99th: %0.4fs", request_timer['99percentile'])
-    log.info("  99.9th: %0.4fs", request_timer['999percentile'])
-
-
 def benchmark():
     args = parse_options()
 
@@ -241,9 +188,9 @@ def benchmark():
     log.info("==== {} ====".format(conn_class.__name__,))
 
     # remove cluster setup/close time? like take the max of start/end time?
-    start = time.time()
 
     jobs = multiprocessing.cpu_count()
+    output_metrics_q = multiprocessing.Manager().Queue()
     pool = multiprocessing.Pool(jobs)
 
     benchmark_object_list = [BenchmarkObject(i,  # process number
@@ -261,90 +208,118 @@ def benchmark():
     pool.close()
     pool.join()
 
-    end = time.time()
+    process_metrics(output_metrics_q)
+
     teardown(args)
 
-    total = end - start
+
+def process_metrics(output_metrics_q):
+    min_start, max_end = sys.maxint, 0
+    count_stats = defaultdict(int)
+    latency_stats = defaultdict(float)
+
+    while not output_metrics_q.empty():
+        # count_stats:
+        # {'count': 30, 'retries': 0, 'read_timeouts': 0, 'write_timeouts':
+        # 0, 'connection_errors': 0, 'other_errors': 0})
+
+        # latency_stats:
+        # {'99percentile': 0.009811162948608398, '75percentile':
+        # 0.009811162948608398, '95percentile': 0.009811162948608398, 'max':
+        # 0.009811162948608398, '98percentile': 0.009811162948608398, 'min':
+        # 0.007244110107421875, 'median': 0.007951140403747559,
+        # '999percentile': 0.009811162948608398, 'stddev':
+        # 0.0030483972590959435, 'mean': 0.007951140403747559})
+
+        stats, start, end = output_metrics_q.get()
+        min_start = min(start, min_start)
+        max_end = max(end, max_end)
+        for key, value in stats.iteritems():
+            if key == 'request_timer':
+                for lkey, fval in value.iteritems():
+                    if lkey == 'count':
+                        count_stats[lkey] += fval
+                    else:
+                        latency_stats[lkey] = max(fval,
+                                                  latency_stats[lkey])
+            else:
+                count_stats[key] += value
+
+
+    log.info("Connection errors: %d", count_stats['connection_errors'])
+    log.info("Write timeouts: %d", count_stats['write_timeouts'])
+    log.info("Read timeouts: %d", count_stats['read_timeouts'])
+    log.info("Unavailables: %d", count_stats['unavailables'])
+    log.info("Other errors: %d", count_stats['other_errors'])
+    log.info("Retries: %d", count_stats['retries'])
+
+    log.info("Request latencies:")
+    log.info("  min: %0.4fs", latency_stats['min'])
+    log.info("  max: %0.4fs", latency_stats['max'])
+    log.info("  mean: %0.4fs", latency_stats['mean'])
+    log.info("  stddev: %0.4fs", latency_stats['stddev'])
+    log.info("  median: %0.4fs", latency_stats['median'])
+    log.info("  75th: %0.4fs", latency_stats['75percentile'])
+    log.info("  95th: %0.4fs", latency_stats['95percentile'])
+    log.info("  98th: %0.4fs", latency_stats['98percentile'])
+    log.info("  99th: %0.4fs", latency_stats['99percentile'])
+    log.info("  99.9th: %0.4fs", latency_stats['999percentile'])
+
+    total = max_end - min_start
     log.info("Total time: %0.2fs" % total)
-    log.info("Average throughput: %0.2f/sec" % (args.num_ops / total))
+    log.info("Average throughput: %0.2f/sec" % (count_stats['count'] / total))
 
 
-class BenchmarkObject:
-    TOTAL_KAFKA_PARTITION = 5
+def apply_load(benchmark_object):
+    """
 
-    def __init__(self, process_num, kwargs, hosts,
-                 keyspace, query, values,
-                 num_queries, num_keys, profile):
-        self.process_num = process_num
-        self.hosts = hosts
-        self.kwargs = kwargs
-        self.keyspace = keyspace
-        self.query = query  # TODO: use prepare_statement?
-        # abstraction: no need
-        self.values = values
-        self.num_queries = num_queries
-        self.num_keys = num_keys  # to scale
-        self.profiler = Profile() if profile else None
+    :param benchmark_objects:
+    :return:
+    """
 
-    def start_profile(self):
-        if self.profiler:
-            self.profiler.enable()
+    hosts = benchmark_object.hosts
+    kwargs = benchmark_object.kwargs
+    num_queries = benchmark_object.num_queries
+    output_metrics_q = benchmark_object.output_metrics_q
 
-    def finish_profile(self):
-        if self.profiler:
-            self.profiler.disable()
-            self.profiler.dump_stats('profile-%d' % self.process_num)
+    log.debug("start {}".format(multiprocessing.current_process().name))
 
-    # TODO: this is a overridable function
-    def run_query(self, process_num, session):
-        """ run the read-modify-write query to update counter
-        :param key:
-        :return: a future to wait for result
-        """
+    cluster = Cluster(hosts, **kwargs)
+    session = cluster.connect(KEYSPACE)
 
-        # randomly generate a key between range
-        # for simiplicity, just assume 200 campaign_id,
-        # (cid, hour) is the key, so just let hour be tied to process number
-        campaign_id = random.randint(0, self.num_keys + 1)
-        hour = process_num
+    futures = []
+    benchmark_object.start_profile()
 
+    start = time.time()
+
+    for i in range(num_queries):
+        future = benchmark_object.run_query(session)
+        futures.append(future)
+
+    for future in futures:
         try:
-            # synchronously read current count
-            # kafka_partition = random.randint(0, self.TOTAL_KAFKA_PARTITION)
-            # tmp
-            kafka_partition = 0
-            cond = "campaign_id={cid} and hour={hour} and kafka_partition={" \
-                   "kafka_partition}".format(cid=campaign_id,
-                                             hour=hour,
-                                             kafka_partition=kafka_partition)
-
-            read_query = "SELECT {col1},{col2} " \
-                         "FROM {table} WHERE {cond}".format(
-                                col1='kafka_offset',
-                                col2='clicks_count',
-                                table=TABLE,
-                                cond=cond)
-
-            result = session.execute(read_query)
-
-            # run lwt query to update count
-            old_offset = result[0].kafka_offset
-            old_count = result[0].clicks_count
-            lwt_query = "UPDATE {table} SET kafka_offset={new_offset}, " \
-                        "clicks_count={new_count} " \
-                        "WHERE {cond} " \
-                        "if kafka_offset={old_offset}".format(
-                            table=TABLE,
-                            new_count=old_count + 5,
-                            new_offset=old_offset + 1,
-                            cond=cond,
-                            old_offset=old_offset)
-
-            return session.execute_async(lwt_query)
+            future.result()
         except Exception:
-            print("Exception in worker:")
-            traceback.print_exc()
-            raise
+            pass
+
+    end = time.time()
+    benchmark_object.finish_profile()
+
+    # cant pass stats back directly as it has lambda (cannot pickle)
+    cass_stats = {}
+    stats = scales.getStats()['cassandra']
+
+    cass_stats['connection_errors'] = stats['connection_errors']
+    cass_stats['write_timeouts'] = stats['write_timeouts']
+    cass_stats['read_timeouts'] = stats['read_timeouts']
+    cass_stats['other_errors'] = stats['other_errors']
+    cass_stats['retries'] = stats['retries']
+    cass_stats['request_timer'] = stats['request_timer']  # dict
+
+    output_metrics_q.put((cass_stats, start, end))
+
+    cluster.shutdown()
+
 
 if __name__ == "__main__":
     benchmark()
