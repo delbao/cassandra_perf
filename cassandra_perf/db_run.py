@@ -208,12 +208,12 @@ def benchmark():
     pool.close()
     pool.join()
 
-    process_metrics(output_metrics_q)
+    process_metrics(output_metrics_q, args)
 
     teardown(args)
 
 
-def process_metrics(output_metrics_q):
+def process_metrics(output_metrics_q, args):
     min_start, max_end = sys.maxint, 0
     count_stats = defaultdict(int)
     latency_stats = defaultdict(float)
@@ -267,7 +267,7 @@ def process_metrics(output_metrics_q):
 
     total = max_end - min_start
     log.info("Total time: %0.2fs" % total)
-    log.info("Average throughput: %0.2f/sec" % (count_stats['count'] / total))
+    log.info("Average throughput: %0.2f/sec" % (args.num_ops / total))
 
 
 def apply_load(benchmark_object):
